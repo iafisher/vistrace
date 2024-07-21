@@ -4,6 +4,7 @@ use std::process::{Command, Stdio};
 use clap::Parser;
 
 #[derive(Parser, Debug)]
+#[clap(trailing_var_arg = true)]
 struct Args {
     args: Vec<String>,
 }
@@ -12,13 +13,13 @@ fn main() {
     // TODO: check if running on Linux
     let args = Args::parse();
     // TODO: set up anyhow
-    let cmd: std::process::Child = Command::new("echo")
+    let mut cmd: std::process::Child = Command::new("strace")
         .args(args.args)
         .stderr(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    let mut stderr = cmd.stderr.unwrap();
+    let stderr = cmd.stderr.as_mut().unwrap();
 
     // TODO: optimal buffer size?
     let mut buffer = [0; 512];
@@ -28,6 +29,9 @@ fn main() {
         if n == 0 {
             break;
         }
-        println!("read: {:?}", &buffer[0..n]);
+        let s = String::from_utf8_lossy(&buffer[0..n]);
+        print!("{}", s);
     }
+
+    cmd.wait().unwrap();
 }
