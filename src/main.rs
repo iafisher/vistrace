@@ -1,9 +1,10 @@
-use anyhow::{anyhow, Result};
-use std::io::Read;
-use std::process::{Command, Stdio};
-use std::{env, process};
+use std::sync::mpsc;
+use std::{env, process, thread};
 
+use anyhow::Result;
 use clap::Parser;
+
+mod strace;
 
 #[derive(Parser, Debug)]
 #[clap(trailing_var_arg = true)]
@@ -24,36 +25,20 @@ fn main() {
 fn main_can_err() -> Result<()> {
     ensure_linux();
     let args = Args::parse();
-    let mut cmd: std::process::Child = Command::new("strace")
-        .args(args.args)
-        .stderr(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| anyhow!("unable to spawn strace: {}", e))?;
-    let stderr = cmd
-        .stderr
-        .as_mut()
-        .ok_or(anyhow!("unable to access strace's standard error"))?;
 
-    // TODO: optimal buffer size?
-    let mut buffer = [0; 512];
-    loop {
-        let n = stderr
-            .read(&mut buffer)
-            .map_err(|e| anyhow!("unable to read output from strace: {}", e))?;
-        if n == 0 {
-            break;
-        }
-        // TODO: will strace ever print non-ASCII bytes? what happens if, e.g., syscall arg is non-UTF-8 string?
-        let s = std::str::from_utf8(&buffer[0..n])
-            .map_err(|e| anyhow!("could not decode strace output as UTF-8: {}", e))?;
-        print!("{}", s);
+    let (tx, rx) = mpsc::channel::<strace::Syscall>();
+
+    let handle = thread::spawn(move || {
+        strace::strace(&args.args, tx)
+    });
+
+    for msg in rx.iter() {
+        println!("got one: {}", &msg.text[0..10]);
     }
 
-    let exit_result = cmd.wait().map_err(|e| anyhow!("failed to wait for strace to terminate: {}", e))?;
-    if !exit_result.success() {
-        return Err(anyhow!("strace returned a non-zero exit code"));
-    }
+    // unwrap() because join() returns error only if thread panicked
+    // the '?' propagates any actual errors the thread returned
+    handle.join().unwrap()?;
     Ok(())
 }
 
