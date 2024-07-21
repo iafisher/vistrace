@@ -109,9 +109,9 @@ impl<'a> SyscallParser<'a> {
             args.push(arg);
         }
         self.require(')')?;
-        self.whitespace();
+        self.whitespace_comments();
         self.require('=')?;
-        self.whitespace();
+        self.whitespace_comments();
         let return_value = self.consume_i64()?;
 
         Ok(Syscall {
@@ -162,7 +162,7 @@ impl<'a> SyscallParser<'a> {
 
         // this technically matches malformed strings like "(,a,b)"
         self.skip(',');
-        self.whitespace();
+        self.whitespace_comments();
 
         let c = match self.read() {
             Some(c) => c,
@@ -179,15 +179,24 @@ impl<'a> SyscallParser<'a> {
             } else {
                 Ok(Some(SyscallArg::Symbol(symbol)))
             }
-        } else if c.is_ascii_digit() {
+        } else if c.is_ascii_digit() || c == '-' {
             let x = self.consume_i64()?;
-            Ok(Some(SyscallArg::Number(x)))
+            if self.read() == Some('*') {
+                self.advance();
+                let x2 = self.consume_i64()?;
+                Ok(Some(SyscallArg::Product(x, x2)))
+            } else {
+                Ok(Some(SyscallArg::Number(x)))
+            }
         } else if c == '"' {
             let (text, truncated) = self.consume_quoted()?;
             Ok(Some(SyscallArg::Quoted { text, truncated }))
         } else if c == '{' {
             let st = self.consume_struct()?;
             Ok(Some(SyscallArg::Struct(st)))
+        } else if c == '[' {
+            let array = self.consume_array()?;
+            Ok(Some(SyscallArg::Array(array)))
         } else {
             Err(anyhow!("could not parse arg"))
         }
@@ -200,7 +209,7 @@ impl<'a> SyscallParser<'a> {
 
         loop {
             self.skip(',');
-            self.whitespace();
+            self.whitespace_comments();
 
             if self.starts_with("...") {
                 self.advance_n(3);
@@ -226,6 +235,32 @@ impl<'a> SyscallParser<'a> {
         }
         self.require('}')?;
 
+        Ok(r)
+    }
+
+    fn consume_array(&mut self) -> Result<Vec<SyscallArg>> {
+        self.require('[')?;
+        let mut r = Vec::new();
+        loop {
+            self.skip(',');
+            self.whitespace_comments();
+
+            let c = match self.read() {
+                Some(c) => c,
+                None => break,
+            };
+
+            if c == ']' {
+                break;
+            }
+
+            let arg = match self.consume_arg()? {
+                Some(a) => a,
+                None => break,
+            };
+            r.push(arg);
+        }
+        self.require(']')?;
         Ok(r)
     }
 
@@ -256,6 +291,13 @@ impl<'a> SyscallParser<'a> {
     }
 
     fn consume_i64(&mut self) -> Result<i64> {
+        let sign = if self.read() == Some('-') {
+            self.advance();
+            -1
+        } else {
+            1
+        };
+
         let radix = self.consume_optional_i64_prefix();
         let mut r = 0i64;
         loop {
@@ -273,7 +315,7 @@ impl<'a> SyscallParser<'a> {
                 None => break,
             }
         }
-        Ok(r)
+        Ok(sign * r)
     }
 
     fn consume_quoted(&mut self) -> Result<(String, bool)> {
@@ -328,12 +370,31 @@ impl<'a> SyscallParser<'a> {
         Ok(())
     }
 
+    fn whitespace_comments(&mut self) {
+        self.whitespace();
+        self.comments();
+        self.whitespace();
+    }
+
     fn whitespace(&mut self) {
         while let Some(c) = self.read() {
             if !c.is_ascii_whitespace() {
                 break;
             }
             self.advance();
+        }
+    }
+
+    fn comments(&mut self) {
+        if let (Some('/'), Some('*')) = self.read_two() {
+            self.advance_n(2);
+            while !self.done() {
+                if let (Some('*'), Some('/')) = self.read_two() {
+                    self.advance_n(2);
+                    break
+                }
+                self.advance();
+            }
         }
     }
 
@@ -418,10 +479,19 @@ mod tests {
 
         sc = parse_syscall("fstat(1, {st_mode=S_IFIFO|0600, st_size=0, ...}) = 0\n").unwrap();
         assert_eq!(sc.name, "fstat");
+        assert_eq!(sc.args.len(), 2);
         assert_arg_number(&sc.args[0], 1);
         let st = assert_arg_struct(&sc.args[1]);
         assert_arg_flagset(st.get("st_mode").unwrap(), &vec!["S_IFIFO".to_string(), "0600".to_string()]);
         assert_arg_number(st.get("st_size").unwrap(), 0);
+        assert_eq!(sc.return_value, 0);
+
+        sc = parse_syscall("execve(\"/usr/bin/echo\", [\"echo\", \"hello\", \"world\"], 0xffffc98f1ef0 /* 61 vars */) = 0\n").unwrap();
+        assert_eq!(sc.name, "execve");
+        assert_eq!(sc.args.len(), 3);
+        assert_arg_string(&sc.args[0], "/usr/bin/echo", false);
+        assert_arg_array(&sc.args[1], &vec!["echo".to_string(), "hello".to_string(), "world".to_string()]);
+        assert_arg_number(&sc.args[2], 0xffffc98f1ef0);
         assert_eq!(sc.return_value, 0);
     }
 
@@ -441,7 +511,7 @@ mod tests {
 
     #[test]
     fn test_consume_arg() {
-        let mut p = SyscallParser::new("O_RDONLY, 123, \"hello\"");
+        let mut p = SyscallParser::new("O_RDONLY, 123, \"hello\", 1024*3");
         let mut arg = p.consume_arg().unwrap().unwrap();
         assert_arg_symbol(&arg, "O_RDONLY");
 
@@ -450,6 +520,9 @@ mod tests {
 
         arg = p.consume_arg().unwrap().unwrap();
         assert_arg_string(&arg, "hello", false);
+
+        arg = p.consume_arg().unwrap().unwrap();
+        assert_arg_product(&arg, 1024, 3);
 
         assert!(p.consume_arg().unwrap().is_none());
     }
@@ -460,9 +533,9 @@ mod tests {
         let mut v = p.consume_i64().unwrap();
         assert_eq!(v, 123);
 
-        p = SyscallParser::new("0xfF abc");
+        p = SyscallParser::new("-0xfF abc");
         v = p.consume_i64().unwrap();
-        assert_eq!(v, 0xFF);
+        assert_eq!(v, -0xFF);
 
         p = SyscallParser::new("0600");
         v = p.consume_i64().unwrap();
@@ -489,14 +562,14 @@ mod tests {
 
     #[test]
     fn test_advance_whitespace() {
-        let mut p = SyscallParser::new("   ab    ");
-        p.whitespace();
+        let mut p = SyscallParser::new("  /* one comment */   ab    ");
+        p.whitespace_comments();
         assert_eq!(p.read().unwrap(), 'a');
         p.advance();
         assert_eq!(p.read().unwrap(), 'b');
         p.advance();
         assert_eq!(p.read().unwrap(), ' ');
-        p.whitespace();
+        p.whitespace_comments();
         assert!(p.done());
     }
 
@@ -548,6 +621,26 @@ mod tests {
             x
         } else {
             panic!("expected SyscallArg::Struct, got {:?}", arg);
+        }
+    }
+
+    fn assert_arg_array(arg: &SyscallArg, expected: &Vec<String>) {
+        if let SyscallArg::Array(vs) = arg {
+            for (actual_v, expected_v) in std::iter::zip(vs, expected) {
+                assert_arg_string(actual_v, expected_v, false);
+            }
+            assert_eq!(vs.len(), expected.len());
+        } else {
+            panic!("expected SyscallArg::Array, got {:?}", arg);
+        }
+    }
+
+    fn assert_arg_product(arg: &SyscallArg, expected1: i64, expected2: i64) {
+        if let SyscallArg::Product(actual1, actual2) = arg {
+            assert_eq!(*actual1, expected1);
+            assert_eq!(*actual2, expected2);
+        } else {
+            panic!("expected SyscallArg::Product, got {:?}", arg);
         }
     }
 }
