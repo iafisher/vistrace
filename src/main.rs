@@ -26,14 +26,20 @@ fn main_can_err() -> Result<()> {
     ensure_linux();
     let args = Args::parse();
 
-    let (tx, rx) = mpsc::channel::<strace::Syscall>();
+    let (tx, rx) = mpsc::channel::<strace::Message>();
 
-    let handle = thread::spawn(move || {
-        strace::strace(&args.args, tx)
-    });
+    let handle = thread::spawn(move || strace::strace(&args.args, tx));
 
     for msg in rx.iter() {
-        println!("got one: {}", &msg.text[0..10]);
+        match msg {
+            strace::Message::Syscall(s) => {
+                println!("got one: {}", s.name);
+            }
+            strace::Message::ParseError { text, message } => {
+                eprintln!("warning: could not parse strace line: {}", message);
+                eprintln!("  ==> {:?}", text);
+            }
+        }
     }
 
     // unwrap() because join() returns error only if thread panicked
