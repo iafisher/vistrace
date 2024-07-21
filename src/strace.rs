@@ -7,7 +7,7 @@ use anyhow::{anyhow, Result};
 
 pub enum Message {
     Syscall(Syscall),
-    ParseError { text: String, message: String }
+    ParseError { text: String, message: String },
 }
 
 pub struct Syscall {
@@ -18,16 +18,21 @@ pub struct Syscall {
 
 #[derive(Debug)]
 pub enum SyscallArg {
-    Null,
     // backslash escapes in `text` are unresolved, i.e. you will see a backslash followed by an 'n'
     // rather than a newline
     Quoted { text: String, truncated: bool },
     Symbol(String),
-    FlagSet(Vec<String>),
+    FlagSet(Vec<FlagSetValue>),
     Number(i64),
     Product(i64, i64),
     Array(Vec<SyscallArg>),
     Struct(HashMap<String, SyscallArg>),
+}
+
+#[derive(Debug)]
+pub enum FlagSetValue {
+    Symbol(String),
+    Bits(i64),
 }
 
 pub fn strace(cmd: &Vec<String>, tx: mpsc::Sender<Message>) -> Result<()> {
@@ -59,7 +64,10 @@ pub fn strace(cmd: &Vec<String>, tx: mpsc::Sender<Message>) -> Result<()> {
 
         let msg = match parse_syscall(&line) {
             Ok(s) => Message::Syscall(s),
-            Err(e) => Message::ParseError { text: line, message: e.to_string() }
+            Err(e) => Message::ParseError {
+                text: line,
+                message: e.to_string(),
+            },
         };
         tx.send(msg).map_err(|e| anyhow!("transmit error: {}", e))?;
     }
@@ -93,7 +101,7 @@ impl<'a> SyscallParser<'a> {
     fn parse(&mut self) -> Result<Syscall> {
         // structure of syscall line:
         //   <syscall name>(<args>...) = <return> <explanation>
-        let name = self.consume_name()?;
+        let name = self.consume_symbol()?;
         self.require('(')?;
 
         let mut args = Vec::new();
@@ -116,7 +124,7 @@ impl<'a> SyscallParser<'a> {
     // invariant: consume_XXX is called with self.index on the first character of the token,
     // and returns with self.index on the first character of the next token
 
-    fn consume_name(&mut self) -> Result<String> {
+    fn consume_symbol(&mut self) -> Result<String> {
         let start = self.index;
         loop {
             let c = match self.read() {
@@ -149,6 +157,7 @@ impl<'a> SyscallParser<'a> {
         //   - a struct (e.g., {field1=val1, field2=val2 ...})
         //     - the final field of the struct may be followed by an ellipsis
         //   - a C-style comment (e.g., /* 40 vars */)
+        //   - a function call (e.g., makedev(0x1, 0x3))
         //
 
         // this technically matches malformed strings like "(,a,b)"
@@ -163,11 +172,12 @@ impl<'a> SyscallParser<'a> {
         if c == ')' {
             Ok(None)
         } else if c.is_ascii_alphabetic() {
-            let mut flags = self.consume_flagset()?;
-            if flags.len() == 1 {
-                Ok(Some(SyscallArg::Symbol(flags.remove(0))))
-            } else {
+            let symbol = self.consume_symbol()?;
+            if self.read() == Some('|') {
+                let flags = self.consume_flagset(symbol)?;
                 Ok(Some(SyscallArg::FlagSet(flags)))
+            } else {
+                Ok(Some(SyscallArg::Symbol(symbol)))
             }
         } else if c.is_ascii_digit() {
             let x = self.consume_i64()?;
@@ -175,16 +185,67 @@ impl<'a> SyscallParser<'a> {
         } else if c == '"' {
             let (text, truncated) = self.consume_quoted()?;
             Ok(Some(SyscallArg::Quoted { text, truncated }))
+        } else if c == '{' {
+            let st = self.consume_struct()?;
+            Ok(Some(SyscallArg::Struct(st)))
         } else {
             Err(anyhow!("could not parse arg"))
         }
     }
 
-    fn consume_flagset(&mut self) -> Result<Vec<String>> {
-        let mut r = Vec::new();
+    fn consume_struct(&mut self) -> Result<HashMap<String, SyscallArg>> {
+        // example: {st_mode=S_IFCHR|0666, st_rdev=makedev(0x1, 0x3), ...}
+        self.require('{')?;
+        let mut r = HashMap::new();
+
         loop {
-            let symbol = self.consume_name()?;
-            r.push(symbol);
+            self.skip(',');
+            self.whitespace();
+
+            if self.starts_with("...") {
+                self.advance_n(3);
+                break;
+            }
+
+            let c = match self.read() {
+                Some(c) => c,
+                None => break,
+            };
+
+            if !c.is_alphabetic() {
+                break;
+            }
+
+            let field = self.consume_symbol()?;
+            self.require('=')?;
+            let value = match self.consume_arg()? {
+                Some(v) => v,
+                None => return Err(anyhow!("struct field {:?} missing value", field)),
+            };
+            r.insert(field, value);
+        }
+        self.require('}')?;
+
+        Ok(r)
+    }
+
+    fn consume_flagset(&mut self, first: String) -> Result<Vec<FlagSetValue>> {
+        self.require('|')?;
+        let mut r = vec![FlagSetValue::Symbol(first)];
+        loop {
+            let c = match self.read() {
+                Some(c) => c,
+                None => break,
+            };
+
+            if c.is_ascii_digit() {
+                let bits = self.consume_i64()?;
+                r.push(FlagSetValue::Bits(bits));
+            } else {
+                let symbol = self.consume_symbol()?;
+                r.push(FlagSetValue::Symbol(symbol));
+            }
+
             if self.read() != Some('|') {
                 break;
             } else {
@@ -244,12 +305,18 @@ impl<'a> SyscallParser<'a> {
 
     // returns the radix (e.g., 16 for hexadecimal)
     fn consume_optional_i64_prefix(&mut self) -> u32 {
-        if let (Some('0'), Some('x')) = self.read_two() {
+        let two = self.read_two();
+        if let (Some('0'), Some('x')) = two {
             self.advance_n(2);
-            16
-        } else {
-            10
+            return 16;
+        } else if let (Some('0'), Some(c)) = two {
+            if c.is_ascii_digit() {
+                self.advance();
+                return 8;
+            }
         }
+
+        10
     }
 
     fn require(&mut self, expected: char) -> Result<()> {
@@ -258,13 +325,6 @@ impl<'a> SyscallParser<'a> {
             return Err(anyhow!("expected {:?}, got {:?}", expected, actual));
         }
         self.advance();
-        Ok(())
-    }
-
-    fn require_eof(&mut self) -> Result<()> {
-        if !self.done() {
-            return Err(anyhow!("expected end of input"));
-        }
         Ok(())
     }
 
@@ -321,7 +381,9 @@ impl<'a> SyscallParser<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::strace::parse_syscall;
+    use std::collections::HashMap;
+
+    use crate::strace::{parse_syscall, FlagSetValue};
 
     use super::{SyscallArg, SyscallParser};
 
@@ -353,20 +415,28 @@ mod tests {
         assert_arg_string(&sc.args[1], "# Locale name alias data base.\\n#", true);
         assert_arg_number(&sc.args[2], 4096);
         assert_eq!(sc.return_value, 2996);
+
+        sc = parse_syscall("fstat(1, {st_mode=S_IFIFO|0600, st_size=0, ...}) = 0\n").unwrap();
+        assert_eq!(sc.name, "fstat");
+        assert_arg_number(&sc.args[0], 1);
+        let st = assert_arg_struct(&sc.args[1]);
+        assert_arg_flagset(st.get("st_mode").unwrap(), &vec!["S_IFIFO".to_string(), "0600".to_string()]);
+        assert_arg_number(st.get("st_size").unwrap(), 0);
+        assert_eq!(sc.return_value, 0);
     }
 
     #[test]
-    fn test_consume_name() {
+    fn test_consume_symbol() {
         let mut p = SyscallParser::new("read");
-        let mut s = p.consume_name().unwrap();
+        let mut s = p.consume_symbol().unwrap();
         assert_eq!(s, "read");
 
         p = SyscallParser::new("syscall_whatever(");
-        s = p.consume_name().unwrap();
+        s = p.consume_symbol().unwrap();
         assert_eq!(s, "syscall_whatever");
 
         p = SyscallParser::new("123");
-        assert!(p.consume_name().is_err());
+        assert!(p.consume_symbol().is_err());
     }
 
     #[test]
@@ -385,15 +455,6 @@ mod tests {
     }
 
     #[test]
-    fn test_consume_flagset() {
-        let mut p = SyscallParser::new("O_RDONLY|O_CLOEXEC");
-        let flags = p.consume_flagset().unwrap();
-        assert_eq!(flags.len(), 2);
-        assert_eq!(flags[0], "O_RDONLY");
-        assert_eq!(flags[1], "O_CLOEXEC");
-    }
-
-    #[test]
     fn test_consume_i64() {
         let mut p = SyscallParser::new("123");
         let mut v = p.consume_i64().unwrap();
@@ -402,6 +463,14 @@ mod tests {
         p = SyscallParser::new("0xfF abc");
         v = p.consume_i64().unwrap();
         assert_eq!(v, 0xFF);
+
+        p = SyscallParser::new("0600");
+        v = p.consume_i64().unwrap();
+        assert_eq!(v, 0o600);
+
+        p = SyscallParser::new("0");
+        v = p.consume_i64().unwrap();
+        assert_eq!(v, 0);
     }
 
     #[test]
@@ -441,8 +510,18 @@ mod tests {
     }
 
     fn assert_arg_flagset(arg: &SyscallArg, expected: &Vec<String>) {
-        if let SyscallArg::FlagSet(s) = arg {
-            assert_eq!(s, expected);
+        if let SyscallArg::FlagSet(vs) = arg {
+            for (actual_v, expected_v) in std::iter::zip(vs, expected) {
+                match actual_v {
+                    FlagSetValue::Symbol(s) => {
+                        assert_eq!(s, expected_v);
+                    },
+                    FlagSetValue::Bits(x) => {
+                        assert_eq!(*x, i64::from_str_radix(&expected_v[1..], 8).unwrap());
+                    }
+                }
+            }
+            assert_eq!(vs.len(), expected.len());
         } else {
             panic!("expected SyscallArg::FlagSet, got {:?}", arg);
         }
@@ -461,6 +540,14 @@ mod tests {
             assert_eq!(*x, expected);
         } else {
             panic!("expected SyscallArg::Number, got {:?}", arg);
+        }
+    }
+
+    fn assert_arg_struct(arg: &SyscallArg) -> &HashMap<String, SyscallArg> {
+        if let SyscallArg::Struct(x) = arg {
+            x
+        } else {
+            panic!("expected SyscallArg::Struct, got {:?}", arg);
         }
     }
 }
