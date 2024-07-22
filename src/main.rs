@@ -33,11 +33,12 @@ fn main_can_err() -> Result<()> {
     for msg in rx.iter() {
         match msg {
             strace::Message::Syscall(s) => {
+                if let Some(error_details) = s.error_details.as_ref() {
+                    eprintln!("warning: could not fully parse strace line");
+                    eprintln!("  ==> error: {}", error_details.message);
+                    eprintln!("  ==> line:  {}", error_details.fulltext);
+                }
                 println!("got one: {}", s.name);
-            }
-            strace::Message::ParseError { text, message } => {
-                eprintln!("warning: could not parse strace line: {}", message);
-                eprintln!("  ==> {:?}", text);
             }
         }
     }

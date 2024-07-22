@@ -7,13 +7,18 @@ use anyhow::{anyhow, Result};
 
 pub enum Message {
     Syscall(Syscall),
-    ParseError { text: String, message: String },
 }
 
 pub struct Syscall {
     pub name: String,
     pub args: Vec<SyscallArg>,
     pub return_value: i64,
+    pub error_details: Option<SyscallErrorDetails>,
+}
+
+pub struct SyscallErrorDetails {
+    pub message: String,
+    pub fulltext: String,
 }
 
 #[derive(Debug)]
@@ -62,13 +67,8 @@ pub fn strace(cmd: &Vec<String>, tx: mpsc::Sender<Message>) -> Result<()> {
             continue;
         }
 
-        let msg = match parse_syscall(&line) {
-            Ok(s) => Message::Syscall(s),
-            Err(e) => Message::ParseError {
-                text: line,
-                message: e.to_string(),
-            },
-        };
+        let syscall = parse_syscall(&line);
+        let msg = Message::Syscall(syscall);
         tx.send(msg).map_err(|e| anyhow!("transmit error: {}", e))?;
     }
 
@@ -81,13 +81,26 @@ pub fn strace(cmd: &Vec<String>, tx: mpsc::Sender<Message>) -> Result<()> {
     Ok(())
 }
 
-fn parse_syscall(text: &str) -> Result<Syscall> {
-    SyscallParser::new(text).parse()
+fn parse_syscall(text: &str) -> Syscall {
+    let mut parser = SyscallParser::new(text);
+    match parser.parse() {
+        Ok(r) => r,
+        Err(e) => Syscall {
+            name: parser.current_name.clone(),
+            args: Vec::new(),
+            return_value: 0,
+            error_details: Some(SyscallErrorDetails {
+                message: e.to_string(),
+                fulltext: text.to_string(),
+            }),
+        },
+    }
 }
 
 struct SyscallParser<'a> {
     bytes: &'a [u8],
     index: usize,
+    current_name: String,
 }
 
 impl<'a> SyscallParser<'a> {
@@ -95,13 +108,14 @@ impl<'a> SyscallParser<'a> {
         Self {
             bytes: text.as_bytes(),
             index: 0,
+            current_name: String::new(),
         }
     }
 
     fn parse(&mut self) -> Result<Syscall> {
         // structure of syscall line:
         //   <syscall name>(<args>...) = <return> <explanation>
-        let name = self.consume_symbol()?;
+        self.current_name = self.consume_symbol()?;
         self.require('(')?;
 
         let mut args = Vec::new();
@@ -115,9 +129,10 @@ impl<'a> SyscallParser<'a> {
         let return_value = self.consume_i64()?;
 
         Ok(Syscall {
-            name,
+            name: self.current_name.clone(),
             args,
             return_value,
+            error_details: None,
         })
     }
 
@@ -391,7 +406,7 @@ impl<'a> SyscallParser<'a> {
             while !self.done() {
                 if let (Some('*'), Some('/')) = self.read_two() {
                     self.advance_n(2);
-                    break
+                    break;
                 }
                 self.advance();
             }
@@ -450,14 +465,13 @@ mod tests {
 
     #[test]
     fn test_syscall_parse() {
-        let mut sc = parse_syscall("close(3) = 0").unwrap();
+        let mut sc = parse_syscall("close(3) = 0");
         assert_eq!(sc.name, "close");
         assert_eq!(sc.args.len(), 1);
         assert_arg_number(&sc.args[0], 3);
         assert_eq!(sc.return_value, 0);
 
-        sc = parse_syscall("openat(AT_FDCWD, \"/proc/self/mountinfo\", O_RDONLY|O_CLOEXEC) = 3")
-            .unwrap();
+        sc = parse_syscall("openat(AT_FDCWD, \"/proc/self/mountinfo\", O_RDONLY|O_CLOEXEC) = 3");
         assert_eq!(sc.name, "openat");
         assert_eq!(sc.args.len(), 3);
         assert_arg_symbol(&sc.args[0], "AT_FDCWD");
@@ -468,8 +482,7 @@ mod tests {
         );
         assert_eq!(sc.return_value, 3);
 
-        sc = parse_syscall("read(3, \"# Locale name alias data base.\\n#\"..., 4096) = 2996")
-            .unwrap();
+        sc = parse_syscall("read(3, \"# Locale name alias data base.\\n#\"..., 4096) = 2996");
         assert_eq!(sc.name, "read");
         assert_eq!(sc.args.len(), 3);
         assert_arg_number(&sc.args[0], 3);
@@ -477,20 +490,26 @@ mod tests {
         assert_arg_number(&sc.args[2], 4096);
         assert_eq!(sc.return_value, 2996);
 
-        sc = parse_syscall("fstat(1, {st_mode=S_IFIFO|0600, st_size=0, ...}) = 0\n").unwrap();
+        sc = parse_syscall("fstat(1, {st_mode=S_IFIFO|0600, st_size=0, ...}) = 0\n");
         assert_eq!(sc.name, "fstat");
         assert_eq!(sc.args.len(), 2);
         assert_arg_number(&sc.args[0], 1);
         let st = assert_arg_struct(&sc.args[1]);
-        assert_arg_flagset(st.get("st_mode").unwrap(), &vec!["S_IFIFO".to_string(), "0600".to_string()]);
+        assert_arg_flagset(
+            st.get("st_mode").unwrap(),
+            &vec!["S_IFIFO".to_string(), "0600".to_string()],
+        );
         assert_arg_number(st.get("st_size").unwrap(), 0);
         assert_eq!(sc.return_value, 0);
 
-        sc = parse_syscall("execve(\"/usr/bin/echo\", [\"echo\", \"hello\", \"world\"], 0xffffc98f1ef0 /* 61 vars */) = 0\n").unwrap();
+        sc = parse_syscall("execve(\"/usr/bin/echo\", [\"echo\", \"hello\", \"world\"], 0xffffc98f1ef0 /* 61 vars */) = 0\n");
         assert_eq!(sc.name, "execve");
         assert_eq!(sc.args.len(), 3);
         assert_arg_string(&sc.args[0], "/usr/bin/echo", false);
-        assert_arg_array(&sc.args[1], &vec!["echo".to_string(), "hello".to_string(), "world".to_string()]);
+        assert_arg_array(
+            &sc.args[1],
+            &vec!["echo".to_string(), "hello".to_string(), "world".to_string()],
+        );
         assert_arg_number(&sc.args[2], 0xffffc98f1ef0);
         assert_eq!(sc.return_value, 0);
     }
@@ -588,7 +607,7 @@ mod tests {
                 match actual_v {
                     FlagSetValue::Symbol(s) => {
                         assert_eq!(s, expected_v);
-                    },
+                    }
                     FlagSetValue::Bits(x) => {
                         assert_eq!(*x, i64::from_str_radix(&expected_v[1..], 8).unwrap());
                     }
