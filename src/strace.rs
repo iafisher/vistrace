@@ -13,6 +13,8 @@ pub struct Syscall {
     pub name: String,
     pub args: Vec<SyscallArg>,
     pub return_value: i64,
+    pub entry_time_micros: u64,
+    pub syscall_time_micros: u64,
     pub error_details: Option<SyscallErrorDetails>,
 }
 
@@ -49,6 +51,8 @@ pub enum FlagSetValue {
 
 pub fn strace(cmd: &Vec<String>, tx: mpsc::Sender<Message>) -> Result<()> {
     let mut child: std::process::Child = Command::new("strace")
+        .arg("--absolute-timestamps=format:unix,us")
+        .arg("--syscall-times=us")
         .args(cmd)
         .stderr(Stdio::piped())
         .stdout(Stdio::piped())
@@ -72,11 +76,12 @@ pub fn strace(cmd: &Vec<String>, tx: mpsc::Sender<Message>) -> Result<()> {
 
         // '+++' is used to report the exit code at end of process
         // '---' is used to report signals
-        if line.starts_with("+++") || line.starts_with("---") {
+        // '[ ... ]' is used to report process interactions
+        if line.starts_with("+++") || line.starts_with("---") || line.starts_with("[") {
             continue;
         }
 
-        let syscall = parse_syscall(&line);
+        let syscall = parse_syscall(&line, true);
         let msg = Message::Syscall(syscall);
         tx.send(msg).map_err(|e| anyhow!("transmit error: {}", e))?;
     }
@@ -90,14 +95,16 @@ pub fn strace(cmd: &Vec<String>, tx: mpsc::Sender<Message>) -> Result<()> {
     Ok(())
 }
 
-fn parse_syscall(text: &str) -> Syscall {
+fn parse_syscall(text: &str, timestamps: bool) -> Syscall {
     let mut parser = SyscallParser::new(text);
-    match parser.parse() {
+    match parser.parse(timestamps) {
         Ok(r) => r,
         Err(e) => Syscall {
             name: parser.current_name.clone(),
             args: Vec::new(),
             return_value: 0,
+            entry_time_micros: 0,
+            syscall_time_micros: 0,
             error_details: Some(SyscallErrorDetails {
                 message: e.to_string(),
                 fulltext: text.to_string(),
@@ -121,9 +128,15 @@ impl<'a> SyscallParser<'a> {
         }
     }
 
-    fn parse(&mut self) -> Result<Syscall> {
+    fn parse(&mut self, timestamps: bool) -> Result<Syscall> {
         // structure of syscall line:
-        //   <syscall name>(<args>...) = <return> <explanation>
+        //   <entry time> <syscall name>(<args>...) = <return> <explanation> <exit time>
+        let entry_time_micros = if timestamps {
+            self.consume_timestamp()?
+        } else {
+            0
+        };
+        self.whitespace_comments();
         self.current_name = self.consume_symbol()?;
         self.require('(')?;
 
@@ -136,11 +149,20 @@ impl<'a> SyscallParser<'a> {
         self.require('=')?;
         self.whitespace_comments();
         let return_value = self.consume_i64()?;
+        self.skip_to('<');
+        self.advance();
+        let syscall_time_micros = if timestamps {
+            self.consume_timestamp()?
+        } else {
+            0
+        };
 
         Ok(Syscall {
             name: self.current_name.clone(),
             args,
             return_value,
+            entry_time_micros,
+            syscall_time_micros,
             error_details: None,
         })
     }
@@ -370,6 +392,39 @@ impl<'a> SyscallParser<'a> {
         Ok(sign * r)
     }
 
+    /// assumes time is in fractional seconds, returns time in microseconds
+    fn consume_timestamp(&mut self) -> Result<u64> {
+        let mut r = 0u64;
+        let mut decimal_places_seen = -1;
+        loop {
+            let c = match self.read() {
+                Some(c) => c,
+                None => break,
+            };
+
+            if let Some(v) = c.to_digit(10) {
+                self.advance();
+                if decimal_places_seen >= 0 {
+                    decimal_places_seen += 1;
+                }
+
+                // microsecond precision is 6 decimal places
+                if decimal_places_seen > 6 {
+                    break;
+                }
+
+                r *= 10;
+                r += v as u64;
+            } else if c == '.' {
+                self.advance();
+                decimal_places_seen = 0;
+            } else {
+                break;
+            }
+        }
+        Ok(r)
+    }
+
     fn consume_quoted(&mut self) -> Result<(String, bool)> {
         self.require('"')?;
         let start = self.index;
@@ -458,6 +513,20 @@ impl<'a> SyscallParser<'a> {
         }
     }
 
+    fn skip_to(&mut self, delim: char) {
+        loop {
+            match self.read() {
+                Some(c) => {
+                    if c == delim {
+                        break;
+                    }
+                    self.advance();
+                }
+                None => break,
+            }
+        }
+    }
+
     fn read(&mut self) -> Option<char> {
         if self.done() {
             return None;
@@ -517,13 +586,16 @@ mod tests {
 
     #[test]
     fn test_syscall_parse() {
-        let mut sc = parse_syscall("close(3) = 0");
+        let mut sc = parse_syscall("close(3) = 0", false);
         assert_eq!(sc.name, "close");
         assert_eq!(sc.args.len(), 1);
         assert_arg_number(&sc.args[0], 3);
         assert_eq!(sc.return_value, 0);
 
-        sc = parse_syscall("openat(AT_FDCWD, \"/proc/self/mountinfo\", O_RDONLY|O_CLOEXEC) = 3");
+        sc = parse_syscall(
+            "openat(AT_FDCWD, \"/proc/self/mountinfo\", O_RDONLY|O_CLOEXEC) = 3",
+            false,
+        );
         assert_eq!(sc.name, "openat");
         assert_eq!(sc.args.len(), 3);
         assert_arg_symbol(&sc.args[0], "AT_FDCWD");
@@ -534,7 +606,10 @@ mod tests {
         );
         assert_eq!(sc.return_value, 3);
 
-        sc = parse_syscall("read(3, \"# Locale name alias data base.\\n#\"..., 4096) = 2996");
+        sc = parse_syscall(
+            "read(3, \"# Locale name alias data base.\\n#\"..., 4096) = 2996",
+            false,
+        );
         assert_eq!(sc.name, "read");
         assert_eq!(sc.args.len(), 3);
         assert_arg_number(&sc.args[0], 3);
@@ -542,7 +617,10 @@ mod tests {
         assert_arg_number(&sc.args[2], 4096);
         assert_eq!(sc.return_value, 2996);
 
-        sc = parse_syscall("fstat(1, {st_mode=S_IFIFO|0600, st_size=0, ...}) = 0\n");
+        sc = parse_syscall(
+            "fstat(1, {st_mode=S_IFIFO|0600, st_size=0, ...}) = 0\n",
+            false,
+        );
         assert_eq!(sc.name, "fstat");
         assert_eq!(sc.args.len(), 2);
         assert_arg_number(&sc.args[0], 1);
@@ -554,7 +632,7 @@ mod tests {
         assert_arg_number(st.get("st_size").unwrap(), 0);
         assert_eq!(sc.return_value, 0);
 
-        sc = parse_syscall("execve(\"/usr/bin/echo\", [\"echo\", \"hello\", \"world\"], 0xffffc98f1ef0 /* 61 vars */) = 0\n");
+        sc = parse_syscall("execve(\"/usr/bin/echo\", [\"echo\", \"hello\", \"world\"], 0xffffc98f1ef0 /* 61 vars */) = 0\n", false);
         assert_eq!(sc.name, "execve");
         assert_eq!(sc.args.len(), 3);
         assert_arg_string(&sc.args[0], "/usr/bin/echo", false);
@@ -565,19 +643,22 @@ mod tests {
         assert_arg_number(&sc.args[2], 0xffffc98f1ef0);
         assert_eq!(sc.return_value, 0);
 
-        sc = parse_syscall("read(0, \"{\\\"lol\\\":42}\\n\", 8192)         = 11");
+        sc = parse_syscall("read(0, \"{\\\"lol\\\":42}\\n\", 8192)         = 11", false);
         assert_eq!(sc.name, "read");
         assert_eq!(sc.args.len(), 3);
         assert_arg_string(&sc.args[1], "{\\\"lol\\\":42}\\n", false);
 
-        sc = parse_syscall("getdents64(3, 0xba02287ca030 /* 9 entries */, 32768) = 280");
+        sc = parse_syscall(
+            "getdents64(3, 0xba02287ca030 /* 9 entries */, 32768) = 280",
+            false,
+        );
         assert_eq!(sc.name, "getdents64");
         assert_eq!(sc.args.len(), 3);
         assert_arg_number(&sc.args[0], 3);
         assert_arg_number(&sc.args[1], 0xba02287ca030);
         assert_arg_number(&sc.args[2], 32768);
 
-        sc = parse_syscall("clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0xef6aae8510f0) = 2077145");
+        sc = parse_syscall("clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0xef6aae8510f0) = 2077145", false);
         assert_eq!(sc.name, "clone");
         assert_eq!(sc.args.len(), 3);
         assert_arg_symbol(&sc.args[0], "NULL");
@@ -594,7 +675,7 @@ mod tests {
         assert_arg_number(&sc.args[2], 0xef6aae8510f0);
         assert_eq!(sc.args[2].name, "child_tidptr");
 
-        sc = parse_syscall("fstat(2, {st_mode=S_IFCHR|0666, st_rdev=makedev(0x1, 0x3), ...}) = 0");
+        sc = parse_syscall("fstat(2, {st_mode=S_IFCHR|0666, st_rdev=makedev(0x1, 0x3), ...}) = 0", false);
         assert_eq!(sc.name, "fstat");
         assert_eq!(sc.args.len(), 2);
         let fields = assert_arg_struct(&sc.args[1]);
@@ -611,7 +692,7 @@ mod tests {
 
     #[test]
     fn test_syscall_parse_partial() {
-        let sc = parse_syscall("write(");
+        let sc = parse_syscall("write(", false);
         assert_eq!(sc.name, "write");
         assert!(sc.error_details.is_some());
     }
