@@ -5,6 +5,7 @@ use anyhow::Result;
 use clap::Parser;
 
 mod strace;
+mod ui;
 
 #[derive(Parser, Debug)]
 #[clap(trailing_var_arg = true)]
@@ -28,31 +29,14 @@ fn main_can_err() -> Result<()> {
 
     let (tx, rx) = mpsc::channel::<strace::Message>();
 
-    let handle = thread::spawn(move || strace::strace(&args.args, tx));
+    let strace_thread = thread::spawn(move || strace::strace(&args.args, tx));
 
-    let mut num_failed_to_parse = 0;
-    for msg in rx.iter() {
-        match msg {
-            strace::Message::Syscall(s) => {
-                if let Some(error_details) = s.error_details.as_ref() {
-                    eprintln!("warning: could not fully parse strace line");
-                    eprintln!("  ==> error: {}", error_details.message);
-                    eprintln!("  ==> line:  {}", error_details.fulltext);
-                    num_failed_to_parse += 1;
-                }
-                // println!("got one: {}", s.name);
-            }
-        }
-    }
-
-    if num_failed_to_parse > 0 {
-        eprintln!();
-        eprintln!("warning: failed to parse {} line(s)", num_failed_to_parse);
-    }
+    ui::main(rx);
 
     // unwrap() because join() returns error only if thread panicked
     // the '?' propagates any actual errors the thread returned
-    handle.join().unwrap()?;
+    strace_thread.join().unwrap()?;
+
     Ok(())
 }
 
