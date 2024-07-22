@@ -22,7 +22,13 @@ pub struct SyscallErrorDetails {
 }
 
 #[derive(Debug)]
-pub enum SyscallArg {
+pub struct SyscallArg {
+    pub name: String,
+    pub value: SyscallArgValue,
+}
+
+#[derive(Debug)]
+pub enum SyscallArgValue {
     // backslash escapes in `text` are unresolved, i.e. you will see a backslash followed by an 'n'
     // rather than a newline
     Quoted { text: String, truncated: bool },
@@ -63,7 +69,9 @@ pub fn strace(cmd: &Vec<String>, tx: mpsc::Sender<Message>) -> Result<()> {
             break;
         }
 
-        if line.starts_with("+++") {
+        // '+++' is used to report the exit code at end of process
+        // '---' is used to report signals
+        if line.starts_with("+++") || line.starts_with("---") {
             continue;
         }
 
@@ -176,6 +184,7 @@ impl<'a> SyscallParser<'a> {
         //
 
         // this technically matches malformed strings like "(,a,b)"
+        self.whitespace_comments();
         self.skip(',');
         self.whitespace_comments();
 
@@ -190,28 +199,41 @@ impl<'a> SyscallParser<'a> {
             let symbol = self.consume_symbol()?;
             if self.read() == Some('|') {
                 let flags = self.consume_flagset(symbol)?;
-                Ok(Some(SyscallArg::FlagSet(flags)))
+                Ok(Some(SyscallArg::positional(SyscallArgValue::FlagSet(
+                    flags,
+                ))))
+            } else if self.read() == Some('=') {
+                self.advance();
+                let arg = self.consume_arg()?.ok_or(anyhow!("expected argument after '='"))?;
+                Ok(Some(SyscallArg::named(symbol, arg.value)))
             } else {
-                Ok(Some(SyscallArg::Symbol(symbol)))
+                Ok(Some(SyscallArg::positional(SyscallArgValue::Symbol(
+                    symbol,
+                ))))
             }
         } else if c.is_ascii_digit() || c == '-' {
             let x = self.consume_i64()?;
             if self.read() == Some('*') {
                 self.advance();
                 let x2 = self.consume_i64()?;
-                Ok(Some(SyscallArg::Product(x, x2)))
+                Ok(Some(SyscallArg::positional(SyscallArgValue::Product(
+                    x, x2,
+                ))))
             } else {
-                Ok(Some(SyscallArg::Number(x)))
+                Ok(Some(SyscallArg::positional(SyscallArgValue::Number(x))))
             }
         } else if c == '"' {
             let (text, truncated) = self.consume_quoted()?;
-            Ok(Some(SyscallArg::Quoted { text, truncated }))
+            Ok(Some(SyscallArg::positional(SyscallArgValue::Quoted {
+                text,
+                truncated,
+            })))
         } else if c == '{' {
             let st = self.consume_struct()?;
-            Ok(Some(SyscallArg::Struct(st)))
+            Ok(Some(SyscallArg::positional(SyscallArgValue::Struct(st))))
         } else if c == '[' {
             let array = self.consume_array()?;
-            Ok(Some(SyscallArg::Array(array)))
+            Ok(Some(SyscallArg::positional(SyscallArgValue::Array(array))))
         } else {
             Err(anyhow!("could not parse arg"))
         }
@@ -343,6 +365,8 @@ impl<'a> SyscallParser<'a> {
                 end = self.index;
                 self.advance();
                 break;
+            } else if c == '\\' {
+                self.advance();
             }
             self.advance();
         }
@@ -455,13 +479,26 @@ impl<'a> SyscallParser<'a> {
     }
 }
 
+impl SyscallArg {
+    fn positional(value: SyscallArgValue) -> Self {
+        Self {
+            name: String::new(),
+            value,
+        }
+    }
+
+    fn named(name: String, value: SyscallArgValue) -> Self {
+        Self { name, value }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
     use crate::strace::{parse_syscall, FlagSetValue};
 
-    use super::{SyscallArg, SyscallParser};
+    use super::{SyscallArg, SyscallArgValue, SyscallParser};
 
     #[test]
     fn test_syscall_parse() {
@@ -512,6 +549,35 @@ mod tests {
         );
         assert_arg_number(&sc.args[2], 0xffffc98f1ef0);
         assert_eq!(sc.return_value, 0);
+
+        sc = parse_syscall("read(0, \"{\\\"lol\\\":42}\\n\", 8192)         = 11");
+        assert_eq!(sc.name, "read");
+        assert_eq!(sc.args.len(), 3);
+        assert_arg_string(&sc.args[1], "{\\\"lol\\\":42}\\n", false);
+
+        sc = parse_syscall("getdents64(3, 0xba02287ca030 /* 9 entries */, 32768) = 280");
+        assert_eq!(sc.name, "getdents64");
+        assert_eq!(sc.args.len(), 3);
+        assert_arg_number(&sc.args[0], 3);
+        assert_arg_number(&sc.args[1], 0xba02287ca030);
+        assert_arg_number(&sc.args[2], 32768);
+
+        sc = parse_syscall("clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0xef6aae8510f0) = 2077145");
+        assert_eq!(sc.name, "clone");
+        assert_eq!(sc.args.len(), 3);
+        assert_arg_symbol(&sc.args[0], "NULL");
+        assert_eq!(sc.args[0].name, "child_stack");
+        assert_arg_flagset(&sc.args[1], &vec!["CLONE_CHILD_CLEARTID".to_string(), "CLONE_CHILD_SETTID".to_string(), "SIGCHLD".to_string()]);
+        assert_eq!(sc.args[1].name, "flags");
+        assert_arg_number(&sc.args[2], 0xef6aae8510f0);
+        assert_eq!(sc.args[2].name, "child_tidptr");
+    }
+
+    #[test]
+    fn test_syscall_parse_partial() {
+        let sc = parse_syscall("write(");
+        assert_eq!(sc.name, "write");
+        assert!(sc.error_details.is_some());
     }
 
     #[test]
@@ -593,7 +659,7 @@ mod tests {
     }
 
     fn assert_arg_string(arg: &SyscallArg, expected_text: &str, expected_truncated: bool) {
-        if let SyscallArg::Quoted { text, truncated } = arg {
+        if let SyscallArgValue::Quoted { text, truncated } = &arg.value {
             assert_eq!(text, expected_text);
             assert_eq!(*truncated, expected_truncated);
         } else {
@@ -602,7 +668,7 @@ mod tests {
     }
 
     fn assert_arg_flagset(arg: &SyscallArg, expected: &Vec<String>) {
-        if let SyscallArg::FlagSet(vs) = arg {
+        if let SyscallArgValue::FlagSet(vs) = &arg.value {
             for (actual_v, expected_v) in std::iter::zip(vs, expected) {
                 match actual_v {
                     FlagSetValue::Symbol(s) => {
@@ -620,7 +686,7 @@ mod tests {
     }
 
     fn assert_arg_symbol(arg: &SyscallArg, expected: &str) {
-        if let SyscallArg::Symbol(s) = arg {
+        if let SyscallArgValue::Symbol(s) = &arg.value {
             assert_eq!(s, expected);
         } else {
             panic!("expected SyscallArg::Symbol, got {:?}", arg);
@@ -628,7 +694,7 @@ mod tests {
     }
 
     fn assert_arg_number(arg: &SyscallArg, expected: i64) {
-        if let SyscallArg::Number(x) = arg {
+        if let SyscallArgValue::Number(x) = &arg.value {
             assert_eq!(*x, expected);
         } else {
             panic!("expected SyscallArg::Number, got {:?}", arg);
@@ -636,7 +702,7 @@ mod tests {
     }
 
     fn assert_arg_struct(arg: &SyscallArg) -> &HashMap<String, SyscallArg> {
-        if let SyscallArg::Struct(x) = arg {
+        if let SyscallArgValue::Struct(x) = &arg.value {
             x
         } else {
             panic!("expected SyscallArg::Struct, got {:?}", arg);
@@ -644,7 +710,7 @@ mod tests {
     }
 
     fn assert_arg_array(arg: &SyscallArg, expected: &Vec<String>) {
-        if let SyscallArg::Array(vs) = arg {
+        if let SyscallArgValue::Array(vs) = &arg.value {
             for (actual_v, expected_v) in std::iter::zip(vs, expected) {
                 assert_arg_string(actual_v, expected_v, false);
             }
@@ -655,7 +721,7 @@ mod tests {
     }
 
     fn assert_arg_product(arg: &SyscallArg, expected1: i64, expected2: i64) {
-        if let SyscallArg::Product(actual1, actual2) = arg {
+        if let SyscallArgValue::Product(actual1, actual2) = &arg.value {
             assert_eq!(*actual1, expected1);
             assert_eq!(*actual2, expected2);
         } else {

@@ -30,6 +30,7 @@ fn main_can_err() -> Result<()> {
 
     let handle = thread::spawn(move || strace::strace(&args.args, tx));
 
+    let mut num_failed_to_parse = 0;
     for msg in rx.iter() {
         match msg {
             strace::Message::Syscall(s) => {
@@ -37,10 +38,16 @@ fn main_can_err() -> Result<()> {
                     eprintln!("warning: could not fully parse strace line");
                     eprintln!("  ==> error: {}", error_details.message);
                     eprintln!("  ==> line:  {}", error_details.fulltext);
+                    num_failed_to_parse += 1;
                 }
-                println!("got one: {}", s.name);
+                // println!("got one: {}", s.name);
             }
         }
+    }
+
+    if num_failed_to_parse > 0 {
+        eprintln!();
+        eprintln!("warning: failed to parse {} line(s)", num_failed_to_parse);
     }
 
     // unwrap() because join() returns error only if thread panicked
