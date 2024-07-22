@@ -21,13 +21,13 @@ pub struct SyscallErrorDetails {
     pub fulltext: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SyscallArg {
     pub name: String,
     pub value: SyscallArgValue,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum SyscallArgValue {
     // backslash escapes in `text` are unresolved, i.e. you will see a backslash followed by an 'n'
     // rather than a newline
@@ -38,9 +38,10 @@ pub enum SyscallArgValue {
     Product(i64, i64),
     Array(Vec<SyscallArg>),
     Struct(HashMap<String, SyscallArg>),
+    FunctionCall(String, Vec<SyscallArg>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum FlagSetValue {
     Symbol(String),
     Bits(i64),
@@ -204,8 +205,17 @@ impl<'a> SyscallParser<'a> {
                 ))))
             } else if self.read() == Some('=') {
                 self.advance();
-                let arg = self.consume_arg()?.ok_or(anyhow!("expected argument after '='"))?;
+                let arg = self
+                    .consume_arg()?
+                    .ok_or(anyhow!("expected argument after '='"))?;
                 Ok(Some(SyscallArg::named(symbol, arg.value)))
+            } else if self.read() == Some('(') {
+                self.advance();
+                let args = self.consume_arg_list()?;
+                self.require(')')?;
+                Ok(Some(SyscallArg::positional(SyscallArgValue::FunctionCall(
+                    symbol, args,
+                ))))
             } else {
                 Ok(Some(SyscallArg::positional(SyscallArgValue::Symbol(
                     symbol,
@@ -237,6 +247,30 @@ impl<'a> SyscallParser<'a> {
         } else {
             Err(anyhow!("could not parse arg"))
         }
+    }
+
+    fn consume_arg_list(&mut self) -> Result<Vec<SyscallArg>> {
+        let mut r = Vec::new();
+        loop {
+            self.skip(',');
+            self.whitespace_comments();
+
+            let c = match self.read() {
+                Some(c) => c,
+                None => break,
+            };
+
+            if c == ']' {
+                break;
+            }
+
+            let arg = match self.consume_arg()? {
+                Some(a) => a,
+                None => break,
+            };
+            r.push(arg);
+        }
+        Ok(r)
     }
 
     fn consume_struct(&mut self) -> Result<HashMap<String, SyscallArg>> {
@@ -277,26 +311,7 @@ impl<'a> SyscallParser<'a> {
 
     fn consume_array(&mut self) -> Result<Vec<SyscallArg>> {
         self.require('[')?;
-        let mut r = Vec::new();
-        loop {
-            self.skip(',');
-            self.whitespace_comments();
-
-            let c = match self.read() {
-                Some(c) => c,
-                None => break,
-            };
-
-            if c == ']' {
-                break;
-            }
-
-            let arg = match self.consume_arg()? {
-                Some(a) => a,
-                None => break,
-            };
-            r.push(arg);
-        }
+        let r = self.consume_arg_list()?;
         self.require(']')?;
         Ok(r)
     }
@@ -567,10 +582,31 @@ mod tests {
         assert_eq!(sc.args.len(), 3);
         assert_arg_symbol(&sc.args[0], "NULL");
         assert_eq!(sc.args[0].name, "child_stack");
-        assert_arg_flagset(&sc.args[1], &vec!["CLONE_CHILD_CLEARTID".to_string(), "CLONE_CHILD_SETTID".to_string(), "SIGCHLD".to_string()]);
+        assert_arg_flagset(
+            &sc.args[1],
+            &vec![
+                "CLONE_CHILD_CLEARTID".to_string(),
+                "CLONE_CHILD_SETTID".to_string(),
+                "SIGCHLD".to_string(),
+            ],
+        );
         assert_eq!(sc.args[1].name, "flags");
         assert_arg_number(&sc.args[2], 0xef6aae8510f0);
         assert_eq!(sc.args[2].name, "child_tidptr");
+
+        sc = parse_syscall("fstat(2, {st_mode=S_IFCHR|0666, st_rdev=makedev(0x1, 0x3), ...}) = 0");
+        assert_eq!(sc.name, "fstat");
+        assert_eq!(sc.args.len(), 2);
+        let fields = assert_arg_struct(&sc.args[1]);
+        assert_arg_flagset(
+            fields.get("st_mode").unwrap(),
+            &vec!["S_IFCHR".to_string(), "0666".to_string()],
+        );
+        let args = assert_arg_function_call(fields.get("st_rdev").unwrap(), "makedev");
+        assert_arg_number(&args[0], 0x1);
+        assert_arg_number(&args[1], 0x3);
+
+        // TODO: "wait4(-1, [{WIFEXITED(s) && WEXITSTATUS(s) == 0}], WNOHANG, NULL) = 2082600"
     }
 
     #[test]
@@ -726,6 +762,15 @@ mod tests {
             assert_eq!(*actual2, expected2);
         } else {
             panic!("expected SyscallArg::Product, got {:?}", arg);
+        }
+    }
+
+    fn assert_arg_function_call(arg: &SyscallArg, expected_name: &str) -> Vec<SyscallArg> {
+        if let SyscallArgValue::FunctionCall(name, args) = &arg.value {
+            assert_eq!(name, expected_name);
+            args.clone()
+        } else {
+            panic!("expected SyscallArg::FunctionCall, got {:?}", arg);
         }
     }
 }
